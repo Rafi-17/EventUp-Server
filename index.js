@@ -34,6 +34,7 @@ async function run() {
     const reviewCollection = client.db("eventUpDB").collection("reviews");
     const notificationCollection = client.db("eventUpDB").collection("notifications");
     const commentCollection = client.db("eventUpDB").collection("comments");
+    const activityCollection = client.db("eventUpDB").collection("activities");
 
     // --------------Middlewares----------------
     const generateSecretCode = () => {
@@ -189,6 +190,7 @@ async function run() {
                                 reason: explanation,
                                 type: 'warning',
                                 read: false,
+                                toastShown: false,
                                 timestamp: new Date()
                             };
                             await notificationCollection.insertOne(notification);
@@ -211,6 +213,15 @@ async function run() {
         const result = await userCollection.find().toArray();
         res.send(result);
     })
+    // API to get a single user's data for their profile page
+    app.get('/users/profile', verifyToken, async(req, res)=>{
+        const email = req.decoded.email;
+        const user = await userCollection.findOne({ email });
+        if (!user) {
+            return res.status(404).send({message: 'User not found'});
+        }
+        res.send(user);
+    })
     //get user role----->
     app.get('/users/role/:email', async(req,res)=>{
         const query = { email : req.params.email };
@@ -231,11 +242,90 @@ async function run() {
             return res.send({message:'User already existed'})
         }
         const result = await userCollection.insertOne(user);
+        //activity log
+        if(result.acknowledged){
+          const activity = {
+            action: 'New user registered',
+            userEmail: user?.email,
+            target: {
+                type: 'user',
+                userId: result.insertedId,
+                name: user?.name || 'Anonymous User'
+            },
+            timestamp: new Date()
+          };
+          await activityCollection.insertOne(activity);
+        }
         res.send(result);
     })
-    //change user role----->
-    app.patch('/users/role/:email', async(req,res)=>{
+    //update user profile
+    app.patch('/users/:email', verifyToken, async (req, res) => {
+      try {
+        const { email } = req.params;
+        const updateData = req.body;
+        
+        // Verify the user is updating their own profile or is an admin
+        if (req.decoded.email !== email && req.decoded.role !== 'admin') {
+          return res.status(403).json({ 
+            success: false, 
+            message: 'Access denied' 
+          });
+        }
+
+        // Remove sensitive fields that shouldn't be updated this way
+        delete updateData.email;
+        delete updateData.role;
+        delete updateData._id;
+
+        // Add timestamp
+        updateData.updatedAt = new Date();
+        console.log(updateData);
+
+        const result = await userCollection.updateOne(
+          { email: email },
+          { $set: updateData }
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).json({ 
+            success: false, 
+            message: 'User not found' 
+          });
+        }
+
+        res.json({ 
+          success: true, 
+          message: 'Profile updated successfully',
+          modifiedCount: result.modifiedCount 
+        });
+
+      } catch (error) {
+        console.error('Error updating user profile:', error);
+        res.status(500).json({ 
+          success: false, 
+          message: 'Server error', 
+          error: error.message 
+        });
+      }
+    });
+    //volunteer role change request
+    app.patch('/users/roleRequest/:email',verifyToken, async(req, res)=>{
+      const email = req.params.email;
+      const {role : newRole} = req?.body;
+      const user = await userCollection.findOne({email : email});
+      if(!user){
+        return res.status(404).send({message:'User not found'})
+      }
+      const result = await userCollection.updateOne(
+        {email : email},
+        {$set:{role:newRole}}
+      )
+      res.send(result);
+    })
+    //user role change----->
+    app.patch('/users/role/:email',verifyToken, verifyAdmin, async(req,res)=>{
         const email = req.params.email;
+        const adminEmail = req.decoded?.email;
         const {role : newRole}= req?.body;
         // console.log(id);
         // console.log(role);
@@ -270,46 +360,106 @@ async function run() {
         const result = await userCollection.updateOne(query, updatedDoc);
 
         if(result.modifiedCount>0 && message){
-          console.log('inside condition',message);
+          // console.log('inside condition',message);
           const notification = {
             email : email,
             message: message,
             type: type,
             read : false,
+            toastShown: false,
             timestamp: new Date()
           }
           await notificationCollection.insertOne(notification);
+        }
+        if(result.acknowledged){
+          const activity = {
+            action: `Changed user role to ${newRole}`,
+            userEmail: adminEmail, // The admin's email from decoded token
+            target: {
+                type: 'user',
+                userId: user._id,
+                name: user.name,
+                previousRole: user.role,
+                newRole: newRole
+            },
+            timestamp: new Date()
+          };
+          await activityCollection.insertOne(activity);
         }
         res.send(result);
     })
 
     // ----------------- NOTIFICATION RELATED API ---------------------
-    app.get('/notifications/:email', async(req, res)=>{
+    //get notifications which hasn't shown toast
+    app.get('/notifications/notToastShown/:email', async(req, res)=>{
       const email = req.params?.email;
-      const query = { email : email, read : false } 
+      const query = { email : email, toastShown : false } 
       const result = await notificationCollection.find(query).toArray();
       res.send(result);
     })
+    //get unread notifications
+    app.get('/notifications/:email', async(req, res) => {
+      const email = req.params?.email;
+      const query = { email: email, read: false };
+      const count = await notificationCollection.countDocuments(query);
+      res.send({ count });
+    });
+    //get all notification for specific user
+    app.get('/notifications/all/:email', verifyToken, async(req, res) => {
+      const email = req.params?.email;
+      const query = { email: email };
+      const result = await notificationCollection.find(query)
+        .sort({ timestamp: -1 })
+        .toArray();
+      res.send(result);
+    });
     app.post('/notifications', async(req, res) => {
       const notificationData = {
         ...req.body,
+        toastShown:false,
         read: false,
         timestamp: new Date()
       };
       const result = await notificationCollection.insertOne(notificationData);
       res.send(result);
     });
-    app.patch('/notifications/markRead/:email', async(req,res)=>{
+    //auto mark toast shown
+    app.patch('/notifications/markToastShown/:email', async(req,res)=>{
       const email = req.params?.email;
-      const query = { email : email, read : false };
+      const query = { email : email, toastShown : false };
       const updatedDoc={
         $set:{
-          read:true
+          toastShown:true
         }
       }
       const result = await notificationCollection.updateMany(query, updatedDoc);
       res.send(result);
     })
+    //mark read update
+    app.patch('/notifications/markAsRead/:id', async(req, res) => {
+      const id = req.params?.id;
+      const result = await notificationCollection.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: { read: true } }
+      );
+      res.send(result);
+    });
+    app.patch('/notifications/markAllAsRead/:email', async(req, res) => {
+      const email = req.params?.email;
+      const result = await notificationCollection.updateMany(
+        { email: email, read: false },
+        { $set: { read: true } }
+      );
+      res.send(result);
+    });
+    //delete notification
+    app.delete('/notifications/:id', async(req, res) => {
+      const id = req.params?.id;
+      const result = await notificationCollection.deleteOne(
+        { _id: new ObjectId(id) }
+      );
+      res.send(result);
+    });
 
     // ----------------- EVENT RELATED API ---------------------
     //get all events
@@ -358,9 +508,10 @@ async function run() {
       const query = { _id : new ObjectId(id) };
       const event = await eventCollection.findOne(query);
       const organizerEmail = event?.organizerEmail;
-      const user = await userCollection.findOne({ email : organizerEmail });
+      const user = await userCollection.findOne({ email : organizerEmail }, { projection: {secretCode:0} });
       const organizerName = user?.name;
-      const result ={...event, organizerName}
+      const result ={...event, organizerName:organizerName}
+      console.log(organizerName, result);
       res.send(result);
     })
     //check secret code
@@ -391,8 +542,22 @@ async function run() {
           }
           event.secretCode = generatedCode;
         }
-        console.log(event);
+        // console.log(event);
         const result = await eventCollection.insertOne(event);
+        //activity log
+        if (result.acknowledged) {
+          const activity = {
+              action: 'New event created',
+              userEmail: req.decoded.email, // The organizer's email
+              target: {
+                  type: 'event',
+                  eventId: result.insertedId,
+                  title: event.title
+              },
+              timestamp: new Date()
+          };
+          await activityCollection.insertOne(activity);
+        }
         res.send(result);
     });
     //update event
@@ -497,6 +662,18 @@ async function run() {
       const result = await eventCollection.updateOne(filter,updatedDoc);
       if(result.modifiedCount>0){
         await userCollection.updateOne({email : userEmail}, {$addToSet:{registeredEvents:eventId}})
+        const event = await eventCollection.findOne({_id : new ObjectId(eventId)});
+        const activity = {
+          action: 'Volunteer registered for event',
+          userEmail: user.email, // The volunteer's email
+          target: {
+              type: 'event',
+              eventId: eventId,
+              title: event?.title
+          },
+          timestamp: new Date()
+        };
+        await activityCollection.insertOne(activity);
       }
       res.send(result);
     })
@@ -504,14 +681,42 @@ async function run() {
     app.patch('/events/removeVolunteer/:eventId', verifyToken, verifyOrganizer, async(req, res) => {
       const eventId = req.params.eventId;
       const { volunteerEmail } = req.body;
-
-      const result = await eventCollection.updateOne(
-        { _id: new ObjectId(eventId) },
-        { $pull: { volunteers: { email: volunteerEmail } } }
-      );
-      res.send(result);
+      try{
+        const event = await eventCollection.findOne({_id: new ObjectId(eventId)});
+        if (!event) {
+          return res.status(404).send({message: 'Event not found'});
+        }
+  
+        const eventUpdateResult = await eventCollection.updateOne(
+          { _id: new ObjectId(eventId) },
+          { $pull: { volunteers: { email: volunteerEmail } } }
+        );
+        const userUpdateResult = await userCollection.updateOne(
+          { email : volunteerEmail },
+          { $pull: { registeredEvents: eventId } }
+        );
+        if(eventUpdateResult.acknowledged && userUpdateResult.acknowledged){
+          const volunteer = await userCollection.findOne({email: volunteerEmail});
+          const activity = {
+            action: 'Volunteer removed from event',
+            userEmail: req.decoded.email, // The organizer's email
+            target: {
+                type: 'volunteer',
+                volunteerName: volunteer.name,
+                eventId: eventId,
+                eventTitle: event.title
+            },
+            timestamp: new Date()
+          };
+          await activityCollection.insertOne(activity);
+        }
+        res.send({ modifiedCount: 1, message: 'Volunteer removed successfully.' });
+      }catch(error){
+        res.status(500).send({ message: 'Internal server error.' });
+      }
       //if res.mofifiedCount>0 then send notification this system is done in the front end
     });
+
     //cancel registration from event update
     app.patch('/events/cancelRegistration/:eventId', verifyToken, async(req,res)=>{
       const eventId = req.params.eventId;
@@ -537,6 +742,7 @@ async function run() {
               reason: `A volunteer with the email ${volunteerEmail} has canceled their registration for your event: "${event.title}".`,
               type: 'neutral',
               read: false,
+              toastShown:false,
               timestamp: new Date()
           };
           await notificationCollection.insertOne(notification);
@@ -560,6 +766,21 @@ async function run() {
           } 
         }
       );
+      if(result.acknowledged){
+        const event = await eventCollection.findOne({_id : new ObjectId(eventId)});
+        const activity = {
+          action: 'Event cancelled',
+          userEmail: req.decoded.email, // The organizer's email
+          target: {
+              type: 'event',
+              eventId: eventId,
+              title: event.title,
+              cancellationReason: reason
+            },
+            timestamp: new Date()
+        };
+        await activityCollection.insertOne(activity);
+      }
       
       res.send(result);
     });
@@ -656,9 +877,25 @@ async function run() {
       const result = await commentCollection.find(query).sort({ timestamp: -1 }).toArray();
       res.send(result);
     })
+    //add comment
     app.post('/comments', verifyToken, async(req, res)=>{
       const comment = req.body;
       const result = await commentCollection.insertOne(comment);
+      if(result.acknowledged){
+        const activity = {
+          action: 'New comment added',
+          userEmail: req.decoded.email,
+          target: {
+              type: 'comment',
+              commentId: result.insertedId,
+              eventId: comment.eventId,
+              text: comment.text,
+              userName:comment.user_name
+          },
+          timestamp: new Date()
+        };
+        await activityCollection.insertOne(activity);
+      }
       res.send(result);
     })
     app.delete(`/comments/:id`, verifyToken, async(req,res)=>{
@@ -673,7 +910,39 @@ async function run() {
         const query = { approved : true }
         const result = await reviewCollection.find(query).toArray();
         res.send(result)
+      })
+    //get user specific review
+    app.get('/reviews/:email', verifyToken, async(req,res)=>{
+      const email = req.params.email;
+      const result = await reviewCollection.find({reviewerEmail : email}).toArray();
+      res.send(result);
     })
+    app.post('/reviews', verifyToken, async(req,res)=>{
+      const reviewData = req.body;
+      const result = await reviewCollection.insertOne(reviewData);
+      res.send(result);
+    })
+
+    // ----------------- ACTIVITY RELATED API ---------------------
+    app.get('/activities', async (req, res) => {
+    const limit = 3; 
+    const activityTypes = ['user', 'event', 'volunteer', 'comment'];
+
+    let activities = [];
+    for (const type of activityTypes) {
+        const result = await activityCollection
+            .find({ 'target.type': type })
+            .sort({ timestamp: -1 })
+            .limit(limit)
+            .toArray();
+        activities.push(...result);
+    }
+    activities.sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
+
+    const finalActivities = activities.slice(0, 4);
+
+    res.send(finalActivities);
+});
 
 
     // Send a ping to confirm a successful connection
