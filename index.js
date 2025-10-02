@@ -27,7 +27,7 @@ const client = new MongoClient(uri, {
 async function run() {
   try {
     // Connect the client to the server	(optional starting in v4.7)
-    await client.connect();
+    // await client.connect();
 
     const userCollection = client.db("eventUpDB").collection("users");
     const eventCollection = client.db("eventUpDB").collection("events");
@@ -54,6 +54,7 @@ async function run() {
         next();
       })
     }
+
     const verifyAdmin = async(req, res, next) =>{
         const email = req.decoded?.email;
         const query = { email : email };
@@ -91,7 +92,7 @@ async function run() {
             const now = new Date();
             // Get the current local time for comparison
             const localNow = new Date(now.getTime() - (now.getTimezoneOffset() * 60000));
-            console.log(localNow);
+            // console.log(localNow);
 
             // Find all upcoming events that have started
             await eventCollection.updateMany(
@@ -116,6 +117,7 @@ async function run() {
                         { _id: event._id },
                         { $set: { status: 'completed' } }
                     );
+                    console.log('event updated to completed');
                 }
             }
 
@@ -125,7 +127,7 @@ async function run() {
         }
     });
 
-    //Cron job to handle volunteer warnings
+    // //Cron job to handle volunteer warnings
     cron.schedule('0 1 * * *', async () => {
         console.log('Running nightly cron job to check for absent volunteers...');
         try {
@@ -140,6 +142,7 @@ async function run() {
                     if (volunteer?.isPresent === false || volunteer?.isPresent === undefined) {
                         const user = await userCollection.findOne({ email: volunteer.email });
                         // console.log('user:',user);
+                        if(user?.role === 'admin') continue;
                         if (user) {
                             let newWarningCount = (user?.warnings || 0) + 1;
                             let notificationMessage = '';
@@ -234,6 +237,57 @@ async function run() {
       const result = await userCollection.countDocuments(query);
       res.send(result);
     })
+    //check ongoing events of user
+    app.get('/users/ongoing-events-status', verifyToken, async (req, res) => {
+            try {
+                const { email } = req.decoded;
+                console.log(email);
+                const user = await userCollection.findOne({ email });
+
+                if (!user) {
+                    return res.status(404).json({ error: 'User not found' });
+                }
+
+                const isOngoing = {
+                    organizedEvent: false,
+                    registeredEvent: false
+                };
+
+                if (user.role === 'admin' || user.role === 'organizer') {
+                    // Check for ongoing events created by the organizer/admin
+                    const ongoingOrganizerEvent = await eventCollection.findOne({
+                        organizerEmail: email,
+                        status: 'ongoing'
+                    });
+
+                    if (ongoingOrganizerEvent) {
+                        isOngoing.organizedEvent = true;
+                    }
+                }
+
+                // Check for ongoing events the user has registered for (for all user roles)
+                const registeredEventIds = user.registeredEvents || [];
+                // Convert the string IDs to ObjectId objects for the MongoDB query
+                const registeredObjectIds = registeredEventIds.map(id => new ObjectId(id));
+                
+                // Check for ongoing events the user has registered for
+                const ongoingRegisteredEvent = await eventCollection.findOne({
+                    _id: { $in: registeredObjectIds },
+                    status: 'ongoing'
+                });
+
+                if (ongoingRegisteredEvent) {
+                    isOngoing.registeredEvent = true;
+                }
+
+                res.json({ isOngoing });
+
+            } catch (error) {
+                console.error('Error in ongoing-events-status API:', error);
+                res.status(500).json({ error: 'Internal server error' });
+            }
+        });
+    //add user
     app.post('/users', async(req,res)=>{
         const user = req.body;
         const query = { email : user?.email };
@@ -241,6 +295,7 @@ async function run() {
         if(existingUser){
             return res.send({message:'User already existed'})
         }
+        user.createdAt = new Date();
         const result = await userCollection.insertOne(user);
         //activity log
         if(result.acknowledged){
@@ -279,7 +334,7 @@ async function run() {
 
         // Add timestamp
         updateData.updatedAt = new Date();
-        console.log(updateData);
+        // console.log(updateData);
 
         const result = await userCollection.updateOne(
           { email: email },
@@ -318,7 +373,7 @@ async function run() {
       }
       const result = await userCollection.updateOne(
         {email : email},
-        {$set:{role:newRole}}
+        {$set:{role:newRole, reqTime: new Date()}}
       )
       res.send(result);
     })
@@ -338,7 +393,7 @@ async function run() {
         let message ='';
         let type;
 
-        if((newRole==='admin' && (previousRole==='volunteer' || previousRole==='organizer' || previousRole==='pending-organizer')) || (newRole==='organizer' && previousRole==='volunteer')){
+        if((newRole==='admin' && (previousRole==='volunteer' || previousRole==='organizer' || previousRole==='pending-organizer')) || (newRole==='organizer' && (previousRole==='volunteer' || previousRole==='pending-organizer'))){
           message=`Congratulations! You are an ${newRole} now`;
           type = 'success';
         }
@@ -350,11 +405,12 @@ async function run() {
           message=`Your role has been changed to ${newRole}`;
           type = 'neutral';
         }
-        console.log(message);
+        // console.log(message);
 
         const updatedDoc={
             $set:{
-              role:newRole
+              role:newRole,
+              reqTime: ''
             }
         }
         const result = await userCollection.updateOne(query, updatedDoc);
@@ -464,43 +520,107 @@ async function run() {
     // ----------------- EVENT RELATED API ---------------------
     //get all events
     app.get('/events', async(req, res)=>{
-        const number = parseInt(req.query?.limit);
-        const status = req.query?.status;
-        const organizerEmail = req.query?.organizerEmail;
-        const userEmail = req.query?.userEmail;
-        // console.log(number,status,organizerEmail);
-        let result;
-        if(number && number>0){
-            result = await eventCollection.find({status:'upcoming'}).project({ secretCode: 0 }).limit(number).toArray();
+      const { count, limit, status, organizerEmail, userEmail, category, search, key } = req.query;
+      
+      // Start with an empty query object
+      const query = {};
+      // console.log(status);
+      // Add filters conditionally
+      if (status) {
+        // If status is a string containing a comma, split it into an array
+        if (typeof status === 'string' && status.includes(',')) {
+            query.status = { $in: status.split(',') };
+        } else if (status !== 'all') {
+            query.status = status;
         }
-        else if(status === 'upcoming'){
-          result = await eventCollection.find({status:'upcoming'}).project({ secretCode: 0 }).toArray();
-        }
-        else if(status === 'completed'){
-          result = await eventCollection.find({status:'completed'}).project({ secretCode: 0 }).toArray();
-        }
-        else if(status === 'cancelled'){
-          result = await eventCollection.find({status:'cancelled'}).project({ secretCode: 0 }).toArray();
-        }
-        else if(organizerEmail){
-          result = await eventCollection.find({organizerEmail:organizerEmail}).project({ secretCode: 0 }).toArray();
-        }
-        else if(userEmail){
-          const query = { email : userEmail };
-          const user = await userCollection.findOne(query);
+    }
+      if (organizerEmail) {
+          query.organizerEmail = organizerEmail;
+      }
+
+      if (userEmail) {
+          const user = await userCollection.findOne({ email: userEmail });
           if (!user) {
-            return res.status(404).send({ error: "User not found" });
+              return res.status(404).send({ error: "User not found" });
           }
-          const registeredEventIds = user.registeredEvents.map(id=>new ObjectId(id));
-          result = await eventCollection.find({
-            _id : { $in: registeredEventIds }
-          }).project({secretCode:0}).toArray();
-        }
-        else{
-            result = await eventCollection.find().project({ secretCode: 0 }).toArray();
-        }
-        res.send(result);
-    })
+          const registeredEventIds = user.registeredEvents.map(id => new ObjectId(id));
+          query._id = { $in: registeredEventIds };
+      }
+
+      if (count) {
+          const totalCount = await eventCollection.countDocuments(query);
+          return res.send({ count: totalCount });
+      }
+
+      if (category && category !== 'all') {
+          query.category = category;
+      }
+
+      // Handle the search term using a regex for case-insensitive search
+      if (search) {
+          const searchRegex = new RegExp(search, 'i');
+          query.$or = [
+              { title: { $regex: searchRegex } },
+              { description: { $regex: searchRegex } },
+              { location: { $regex: searchRegex } }
+          ];
+      }
+      
+      const options = {
+          sort: { _id: -1 }
+      };
+      if (key !== 'true') {
+        options.projection = { secretCode: 0 };
+    } 
+      // console.log(options);
+
+      if (limit && limit > 0) {
+          options.limit = parseInt(limit);
+      }
+      
+      const result = await eventCollection.find(query, options).toArray();
+      // console.log(result);
+      res.send(result);
+  })
+    //was using-------------->
+    // app.get('/events', async(req, res)=>{
+    //     const number = parseInt(req.query?.limit);
+    //     const status = req.query?.status;
+    //     const organizerEmail = req.query?.organizerEmail;
+    //     const userEmail = req.query?.userEmail;
+    //     // console.log(number,status,organizerEmail);
+    //     let result;
+    //     if(number && number>0){
+    //         result = await eventCollection.find({status:'upcoming'}).project({ secretCode: 0 }).limit(number).toArray();
+    //     }
+    //     else if(status === 'upcoming'){
+    //       result = await eventCollection.find({status:'upcoming'}).sort({ _id: -1 }).project({ secretCode: 0 }).toArray();
+    //     }
+    //     else if(status === 'completed'){
+    //       result = await eventCollection.find({status:'completed'}).sort({ _id: -1 }).project({ secretCode: 0 }).toArray();
+    //     }
+    //     else if(status === 'cancelled'){
+    //       result = await eventCollection.find({status:'cancelled'}).sort({ _id: -1 }).project({ secretCode: 0 }).toArray();
+    //     }
+    //     else if(organizerEmail){
+    //       result = await eventCollection.find({organizerEmail:organizerEmail}).project({ secretCode: 0 }).toArray();
+    //     }
+    //     else if(userEmail){
+    //       const query = { email : userEmail };
+    //       const user = await userCollection.findOne(query);
+    //       if (!user) {
+    //         return res.status(404).send({ error: "User not found" });
+    //       }
+    //       const registeredEventIds = user.registeredEvents.map(id=>new ObjectId(id));
+    //       result = await eventCollection.find({
+    //         _id : { $in: registeredEventIds }
+    //       }).project({secretCode:0}).toArray();
+    //     }
+    //     else{
+    //         result = await eventCollection.find().sort({ _id: -1 }).project({ secretCode: 0 }).toArray();
+    //     }
+    //     res.send(result);
+    // })
 
     //get single event
     app.get('/events/:id', async(req,res)=>{
@@ -511,7 +631,7 @@ async function run() {
       const user = await userCollection.findOne({ email : organizerEmail }, { projection: {secretCode:0} });
       const organizerName = user?.name;
       const result ={...event, organizerName:organizerName}
-      console.log(organizerName, result);
+      // console.log(organizerName, result);
       res.send(result);
     })
     //check secret code
@@ -660,12 +780,14 @@ async function run() {
         }
       }
       const result = await eventCollection.updateOne(filter,updatedDoc);
+      const event = await eventCollection.findOne({_id : new ObjectId(eventId)});
       if(result.modifiedCount>0){
+        // add the eventId to the user db collection
         await userCollection.updateOne({email : userEmail}, {$addToSet:{registeredEvents:eventId}})
-        const event = await eventCollection.findOne({_id : new ObjectId(eventId)});
+        // adding this as a activity of the website for admin
         const activity = {
           action: 'Volunteer registered for event',
-          userEmail: user.email, // The volunteer's email
+          userEmail: user.email,
           target: {
               type: 'event',
               eventId: eventId,
@@ -674,6 +796,18 @@ async function run() {
           timestamp: new Date()
         };
         await activityCollection.insertOne(activity);
+        // send notifiation to the organizer
+        const notification = {
+            email: event?.organizerEmail,
+            message: 'New Volunteer Registered',
+            eventTitle: event?.title,
+            reason: `A new volunteer named ${user?.name} has registered for your event: "${event?.title}".`,
+            type: 'success',
+            read: false,
+            toastShown: false,
+            timestamp: new Date()
+        };
+        await notificationCollection.insertOne(notification);
       }
       res.send(result);
     })
@@ -738,9 +872,10 @@ async function run() {
           // Send notification to the organizer
           const notification = {
               email: event.organizerEmail,
-              message: 'Volunteer Canceled Registration',
-              reason: `A volunteer with the email ${volunteerEmail} has canceled their registration for your event: "${event.title}".`,
-              type: 'neutral',
+              message: 'Volunteer Cancelled Registration',
+              eventTitle: event?.title,
+              reason: `A volunteer with the email ${volunteerEmail} has cancelled their registration for your event: "${event.title}".`,
+              type: 'sorry',
               read: false,
               toastShown:false,
               timestamp: new Date()
@@ -789,7 +924,7 @@ async function run() {
       try {
         const { eventId, volunteerEmail } = req.params;
         const {isPresent} = req.body;
-        console.log(isPresent);
+        // console.log(isPresent);
         const event = await eventCollection.findOne({ _id: new ObjectId(eventId) });
         
         if (!event) {
@@ -824,7 +959,7 @@ async function run() {
         const { eventId } = req.params;
         const { secretCode } = req.body;
         const volunteerEmail = req.decoded.email; // Get from token
-        console.log(secretCode,volunteerEmail);
+        // console.log(secretCode,volunteerEmail);
 
         const event = await eventCollection.findOne({ _id: new ObjectId(eventId) });
         
@@ -911,43 +1046,452 @@ async function run() {
         const result = await reviewCollection.find(query).toArray();
         res.send(result)
       })
-    //get user specific review
-    app.get('/reviews/:email', verifyToken, async(req,res)=>{
-      const email = req.params.email;
-      const result = await reviewCollection.find({reviewerEmail : email}).toArray();
-      res.send(result);
+    //get event specific review
+    app.get('/reviews/:eventId', verifyToken, async(req,res)=>{
+        const { eventId } = req.params;
+        const { status } = req.query;
+
+        const query={};
+        
+        if (status && status === 'approved') {
+            query.approved = true;
+        } else {
+            query.eventId = eventId;
+        }
+
+        try {
+            const result = await reviewCollection.find(query).toArray();
+            res.send(result);
+        } catch (error) {
+            console.error('Error fetching reviews:', error);
+            res.status(500).send({ message: 'An internal server error occurred.' });
+        }
     })
+    // post review
     app.post('/reviews', verifyToken, async(req,res)=>{
       const reviewData = req.body;
       const result = await reviewCollection.insertOne(reviewData);
+      console.log(result);
+      if(result.acknowledged){
+        const event = await eventCollection.findOne({_id : new ObjectId(reviewData?.eventId)})
+        console.log(event);
+        if(event){
+          const notification = {
+                email: event?.organizerEmail,
+                message: 'New Event Review Received',
+                eventTitle: event?.title,
+                reason: `A volunteer named ${reviewData?.reviewerName} has reviewed your event "${event.title}".`,
+                type: 'neutral',
+                read: false,
+                toastShown:false,
+                timestamp: new Date()
+            };
+            await notificationCollection.insertOne(notification);
+        }
+      }
       res.send(result);
+    })
+    //change approve status of review
+    app.patch('/reviews/:reviewId/status', verifyToken, async(req,res)=>{
+        const reviewId = req.params.reviewId;
+        const { approved } = req.body;
+        
+        // Validate the input
+        if (!reviewId || typeof approved !== 'boolean') {
+            return res.status(400).send({ message: 'Invalid request data. Requires review ID and a boolean for approval status.' });
+        }
+
+        try {
+            const result = await reviewCollection.updateOne(
+                { _id: new ObjectId(reviewId) },
+                { $set: { approved: approved } }
+            );
+            res.send(result);
+        } catch (error) {
+            console.error('Error updating review approval status:', error);
+            res.status(500).send({ message: 'An internal server error occurred.' });
+        }
     })
 
     // ----------------- ACTIVITY RELATED API ---------------------
     app.get('/activities', async (req, res) => {
-    const limit = 3; 
-    const activityTypes = ['user', 'event', 'volunteer', 'comment'];
+      const limit = 3; 
+      const activityTypes = ['user', 'event', 'volunteer', 'comment'];
 
-    let activities = [];
-    for (const type of activityTypes) {
-        const result = await activityCollection
-            .find({ 'target.type': type })
-            .sort({ timestamp: -1 })
-            .limit(limit)
+      let activities = [];
+      for (const type of activityTypes) {
+          const result = await activityCollection
+              .find({ 'target.type': type })
+              .sort({ timestamp: -1 })
+              .limit(limit)
+              .toArray();
+          activities.push(...result);
+      }
+      activities.sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
+
+      const finalActivities = activities.slice(0, 4);
+
+      res.send(finalActivities);
+    });
+
+    // ----------------- ADMIN STAT API ---------------------   
+    app.get('/admin-stats', async(req, res) => {
+      try {
+        // Total users excluding admin
+        const userResult = await userCollection.aggregate([
+          {
+            $match: {
+              role: { $ne: 'admin' }
+            }
+          },
+          {
+            $count: "totalUsers"
+          }
+        ]).toArray();
+        const totalUsers = userResult.length > 0 ? userResult[0].totalUsers : 0;
+
+        // Total events
+        const totalEvents = await eventCollection.estimatedDocumentCount();
+
+        // Pending organizer requests
+        const pendingRequests = await userCollection.countDocuments({
+          role: 'pending-organizer'
+        });
+
+        // Active organizers
+        const activeOrganizers = await userCollection.countDocuments({
+          role: 'organizer'
+        });
+
+        // Recent activity from activity collection
+        const recentActivity = await activityCollection
+          .find()
+          .sort({ timestamp: -1 })
+          .limit(8)
+          .toArray();
+
+        // Recent users (last 7 days)
+        const recentUsers = await userCollection
+          .find({
+            role: { $ne: 'admin' },
+            createdAt: { $gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) }
+          })
+          .sort({ createdAt: -1 })
+          .limit(5)
+          .toArray();
+
+
+        res.send({
+          totalUsers,
+          totalEvents,
+          pendingRequests,
+          activeOrganizers,
+          recentActivity,
+          recentUsers
+        });
+      } catch (error) {
+        res.status(500).send({ error: error.message });
+      }
+    });
+
+    // ----------------- ORGANIZER STAT API ---------------------   
+    app.get('/organizer-stats/:email', verifyToken, async(req, res) => {
+      try {
+        const { email } = req.params;
+
+        // My events summary
+        const eventStats = await eventCollection.aggregate([
+          { $match: { organizerEmail: email } },
+          {
+            $group: {
+              _id: '$status',
+              count: { $sum: 1 }
+            }
+          }
+        ]).toArray();
+
+        const upcomingEvents = eventStats.find(stat => stat._id === 'upcoming')?.count || 0;
+        const completedEvents = eventStats.find(stat => stat._id === 'completed')?.count || 0;
+        const cancelledEvents = eventStats.find(stat => stat._id === 'cancelled')?.count || 0;
+
+        // Recent volunteer activity on my events
+        const recentActivity = await eventCollection.aggregate([
+          { $match: { organizerEmail: email } },
+          { $unwind: '$volunteers' },
+          { $sort: { 'volunteers.registeredAt': -1 } },
+          { $limit: 10 },
+          {
+            $project: {
+              eventTitle: '$title',
+              volunteerName: '$volunteers.name',
+              volunteerEmail: '$volunteers.email',
+              registeredAt: '$volunteers.registeredAt'
+            }
+          }
+        ]).toArray();
+
+        // Upcoming deadlines (my upcoming events)
+        const upcomingDeadlines = await eventCollection.find({
+          organizerEmail: email,
+          status: 'upcoming',
+          date: { $gte: new Date().toISOString() }
+        })
+        .sort({ date: 1 })
+        .limit(5)
+        .project({ title: 1, date: 1, location: 1, volunteers: 1, requiredVolunteers: 1 })
+        .toArray();
+
+        // My volunteer activity (events I registered for)
+        const myVolunteerEvents = await eventCollection.aggregate([
+          { $match: { 'volunteers.email': email } },
+          { $count: 'registeredEvents' }
+        ]).toArray();
+
+        const registeredEventsCount = myVolunteerEvents.length > 0 ? myVolunteerEvents[0].registeredEvents : 0;
+
+        res.json({
+          eventStats: {
+            upcoming: upcomingEvents,
+            completed: completedEvents,
+            cancelled: cancelledEvents
+          },
+          recentActivity,
+          upcomingDeadlines,
+          registeredEventsCount
+        });
+
+      } catch (error) {
+        res.status(500).json({ error: error.message });
+      }
+    });
+
+    // ------------------VOLUNTEER STAT API--------------------
+    app.get('/stat/:email',async(req,res)=>{
+      const email = req.params.email;
+      const user = await userCollection.findOne({ email }, { projection: { interests: 1 } });
+        const userInterests = user?.interests || [];
+
+        // Recommended events based on interests
+        let recommendedEvents;
+        let recommendationMessage = '';
+
+        if (userInterests.length > 0) {
+          const interestsLowerCase = userInterests.map(interest => interest.toLowerCase());
+          // console.log(interestsLowerCase);
+          
+          recommendedEvents = await eventCollection.find({
+            status: 'upcoming',
+            date: { $gte: new Date().toISOString() },
+            'volunteers.email': { $ne: email }, // Not already registered
+            category: { 
+              $in: interestsLowerCase.map(interest => new RegExp(interest, 'i'))
+            }
+          })
+          .sort({ date: 1 })
+          .limit(6)
+          .project({ title: 1, date: 1, location: 1, category: 1, organizerName: 1, volunteers: 1, requiredVolunteers: 1 })
+          .toArray();
+        } else {
+          // Show recent upcoming events with a message
+          recommendedEvents = await eventCollection.find({
+            status: 'upcoming',
+            date: { $gte: new Date() },
+            'volunteers.email': { $ne: email }
+          })
+          .sort({ createdAt: -1 })
+          .limit(6)
+          .project({ title: 1, date: 1, location: 1, category: 1, organizerName: 1, volunteers: 1, requiredVolunteers: 1 })
+          .toArray();
+
+          recommendationMessage = 'Help us find events for you! Add your interests to get personalized recommendations.';
+        }
+        res.send(recommendedEvents)
+    })
+
+    //real api
+    app.get('/volunteer-stats/:email', verifyToken, async(req, res) => {
+      try {
+        const { email } = req.params;
+
+        // My upcoming events
+        const upcomingEvents = await eventCollection.find({
+          'volunteers.email': email,
+          status: 'upcoming',
+          date: { $gte: new Date().toISOString() }
+        })
+        .sort({ date: 1 })
+        .limit(5)
+        .project({ title: 1, date: 1, location: 1, organizerName: 1, _id: 1 })
+        .toArray();
+
+        // My volunteer impact - including missed events
+        const impactStats = await eventCollection.aggregate([
+          { $match: { 'volunteers.email': email } },
+          { $unwind: "$volunteers" },
+          { $match: { "volunteers.email": email }},
+          {
+            $facet: {
+              totalEvents: [{ $count: "count" }],
+              presentEvents: [
+                { $match: { "volunteers.isPresent": true }},
+                { $count: "count" }
+              ],
+              missedEvents: [
+                { 
+                  $match: { 
+                    "status": "completed",
+                    $or: [
+                      { "volunteers.isPresent": { $exists: false } },
+                      { "volunteers.isPresent": false }
+                    ]
+                  }
+                },
+                { $count: "count" }
+              ],
+              totalHours: [
+                { 
+                  $match: { 
+                    "volunteers.isPresent": true,
+                    "status": "completed"
+                  }
+                },
+                {
+                  $group: {
+                    _id: null,
+                    hours: { $sum: { $divide: ['$duration', 60] }}
+                  }
+                }
+              ]
+            }
+          }
+        ]).toArray();
+
+        const stats = impactStats[0];
+        const impact = {
+          totalEvents: stats.totalEvents[0]?.count || 0,
+          completedEvents: stats.presentEvents[0]?.count || 0,
+          missedEvents: stats.missedEvents[0]?.count || 0,
+          totalHours: Math.round(stats.totalHours[0]?.hours || 0)
+        };
+
+        // Get user interests
+        const user = await userCollection.findOne({ email }, { projection: { interests: 1 } });
+        const userInterests = user?.interests || [];
+
+        // Recommended events logic
+        let recommendedEvents = [];
+        let recommendationMessage = '';
+        const RECOMMENDATION_LIMIT = 3; // Adjust based on your frontend grid (4, 5, or 6)
+
+        if (userInterests.length > 0) {
+          // Try to find events matching user interests
+          const interestsRegex = userInterests.map(interest => new RegExp(interest, 'i'));
+          
+          const matchingEvents = await eventCollection.find({
+            status: 'upcoming',
+            date: { $gte: new Date().toISOString() },
+            'volunteers.email': { $ne: email },
+            category: { $in: interestsRegex }
+          })
+          .sort({ date: 1 })
+          .limit(RECOMMENDATION_LIMIT)
+          .project({ 
+            title: 1, date: 1, location: 1, category: 1, 
+            organizerName: 1, volunteers: 1, requiredVolunteers: 1, _id: 1,
+            interested: { $ifNull: ['$interested', 0] }
+          })
+          .toArray();
+
+          if (matchingEvents.length === 0) {
+            // No matching events found, show popular events
+            recommendedEvents = await eventCollection.find({
+              status: 'upcoming',
+              date: { $gte: new Date().toISOString() },
+              'volunteers.email': { $ne: email }
+            })
+            .sort({ interested: -1, createdAt: -1 })
+            .limit(RECOMMENDATION_LIMIT)
+            .project({ 
+              title: 1, date: 1, location: 1, category: 1, 
+              organizerName: 1, volunteers: 1, requiredVolunteers: 1, _id: 1,
+              interested: { $ifNull: ['$interested', 0] }
+            })
             .toArray();
-        activities.push(...result);
-    }
-    activities.sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
 
-    const finalActivities = activities.slice(0, 4);
+            recommendationMessage = "We couldn't find any upcoming events that match your interests right now. In the meantime, check out what's popular!";
+          } else if (matchingEvents.length < RECOMMENDATION_LIMIT) {
+            // Found some matching events but need to fill remaining slots with popular events
+            const remainingSlots = RECOMMENDATION_LIMIT - matchingEvents.length;
+            const matchingEventIds = matchingEvents.map(event => event._id);
+            
+            const popularEvents = await eventCollection.find({
+              status: 'upcoming',
+              date: { $gte: new Date().toISOString() },
+              'volunteers.email': { $ne: email },
+              _id: { $nin: matchingEventIds } // Exclude already selected events
+            })
+            .sort({ interested: -1, createdAt: -1 })
+            .limit(remainingSlots)
+            .project({ 
+              title: 1, date: 1, location: 1, category: 1, 
+              organizerName: 1, volunteers: 1, requiredVolunteers: 1, _id: 1,
+              interested: { $ifNull: ['$interested', 0] }
+            })
+            .toArray();
 
-    res.send(finalActivities);
-});
+            recommendedEvents = [...matchingEvents, ...popularEvents];
+            recommendationMessage = matchingEvents.length === 1 
+              ? "We found 1 event matching your interests, plus some popular events you might like!"
+              : `We found ${matchingEvents.length} events matching your interests, plus some popular events you might like!`;
+          } else {
+            // Found enough matching events
+            recommendedEvents = matchingEvents;
+          }
+        } else {
+          // No interests selected, show popular events
+          recommendedEvents = await eventCollection.find({
+            status: 'upcoming',
+            date: { $gte: new Date().toISOString() },
+            'volunteers.email': { $ne: email }
+          })
+          .sort({ interested: -1, createdAt: -1 })
+          .limit(RECOMMENDATION_LIMIT)
+          .project({ 
+            title: 1, date: 1, location: 1, category: 1, 
+            organizerName: 1, volunteers: 1, requiredVolunteers: 1, _id: 1,
+            interested: { $ifNull: ['$interested', 0] }
+          })
+          .toArray();
+
+          recommendationMessage = 'Help us find events for you! Add your interests to get personalized recommendations.';
+        }
+
+        // Recent community reviews
+        const recentReviews = await reviewCollection.find({
+          approved: true
+        })
+        .sort({ date: -1 })
+        .limit(5)
+        .project({ eventTitle: 1, rating: 1, quote: 1, reviewerName: 1, date: 1, reviewerRole: 1 })
+        .toArray();
+
+        res.json({
+          upcomingEvents,
+          impact,
+          recommendedEvents,
+          recommendationMessage,
+          recentReviews
+        });
+
+      } catch (error) {
+        res.status(500).json({ error: error.message });
+      }
+    });
 
 
     // Send a ping to confirm a successful connection
-    await client.db("admin").command({ ping: 1 });
-    console.log("Pinged your deployment. You successfully connected to MongoDB!");
+    // await client.db("admin").command({ ping: 1 });
+    // console.log("Pinged your deployment. You successfully connected to MongoDB!");
   } finally {
     // Ensures that the client will close when you finish/error
     // await client.close();
